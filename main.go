@@ -26,6 +26,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
+	"time"
 )
 
 const (
@@ -134,6 +135,11 @@ var (
 		prometheus.BuildFQName(namespace, "", "mount_successful"),
 		"Checks if mountpoint exists, returns a bool value 0 or 1",
 		[]string{"volume", "mountpoint"}, nil)
+
+	lastGeoReplicationSyncTime = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "last_geo_replication_sync_time"),
+		"Last geo-replication sync time",
+		[]string{"volume"}, nil)
 )
 
 // Exporter holds name, path and volumes to be monitored
@@ -163,6 +169,7 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- healInfoFilesCount
 	ch <- volumeWriteable
 	ch <- mountSuccessful
+	ch <- lastGeoReplicationSyncTime
 }
 
 // Collect collects all the metrics
@@ -172,6 +179,8 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	// Couldn't parse xml, so something is really wrong and up=0
 	if err != nil {
 		log.Errorf("couldn't parse xml volume info: %v", err)
+		close(ch)
+		return
 		ch <- prometheus.MustNewConstMetric(
 			up, prometheus.GaugeValue, 0.0,
 		)
@@ -209,54 +218,63 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	peerStatus, peerStatusErr := ExecPeerStatus()
 	if peerStatusErr != nil {
 		log.Errorf("couldn't parse xml of peer status: %v", peerStatusErr)
+		close(ch)
+		return
 	}
 	count := 0
-	for range peerStatus.Peer {
-		count++
+	for _, p := range peerStatus.Peer {
+		if p.Connected == 1 {
+			count++
+		}
 	}
 	ch <- prometheus.MustNewConstMetric(
 		peersConnected, prometheus.GaugeValue, float64(count),
 	)
 
 	// reads profile info
+	fmt.Printf("Profile: %b\n", e.profile)
+
 	if e.profile {
 		for _, volume := range volumeInfo.VolInfo.Volumes.Volume {
 			if e.volumes[0] == allVolumes || ContainsVolume(e.volumes, volume.Name) {
 				volumeProfile, execVolProfileErr := ExecVolumeProfileGvInfoCumulative(volume.Name)
 				if execVolProfileErr != nil {
 					log.Errorf("Error while executing or marshalling gluster profile output: %v", execVolProfileErr)
+					//close(ch)
+					return
 				}
+
 				for _, brick := range volumeProfile.Brick {
-					if strings.HasPrefix(brick.BrickName, e.hostname) {
+					//if strings.HasPrefix(brick.BrickName, e.hostname) {
+					ch <- prometheus.MustNewConstMetric(
+						brickDuration, prometheus.CounterValue, float64(brick.CumulativeStats.Duration), volume.Name, brick.BrickName,
+					)
+
+					ch <- prometheus.MustNewConstMetric(
+						brickDataRead, prometheus.CounterValue, float64(brick.CumulativeStats.TotalRead), volume.Name, brick.BrickName,
+					)
+
+					ch <- prometheus.MustNewConstMetric(
+						brickDataWritten, prometheus.CounterValue, float64(brick.CumulativeStats.TotalWrite), volume.Name, brick.BrickName,
+					)
+					for _, fop := range brick.CumulativeStats.FopStats.Fop {
 						ch <- prometheus.MustNewConstMetric(
-							brickDuration, prometheus.CounterValue, float64(brick.CumulativeStats.Duration), volume.Name, brick.BrickName,
+							brickFopHits, prometheus.CounterValue, float64(fop.Hits), volume.Name, brick.BrickName, fop.Name,
 						)
 
 						ch <- prometheus.MustNewConstMetric(
-							brickDataRead, prometheus.CounterValue, float64(brick.CumulativeStats.TotalRead), volume.Name, brick.BrickName,
+							brickFopLatencyAvg, prometheus.CounterValue, float64(fop.AvgLatency), volume.Name, brick.BrickName, fop.Name,
 						)
 
 						ch <- prometheus.MustNewConstMetric(
-							brickDataWritten, prometheus.CounterValue, float64(brick.CumulativeStats.TotalWrite), volume.Name, brick.BrickName,
+							brickFopLatencyMin, prometheus.CounterValue, float64(fop.MinLatency), volume.Name, brick.BrickName, fop.Name,
 						)
-						for _, fop := range brick.CumulativeStats.FopStats.Fop {
-							ch <- prometheus.MustNewConstMetric(
-								brickFopHits, prometheus.CounterValue, float64(fop.Hits), volume.Name, brick.BrickName, fop.Name,
-							)
 
-							ch <- prometheus.MustNewConstMetric(
-								brickFopLatencyAvg, prometheus.CounterValue, float64(fop.AvgLatency), volume.Name, brick.BrickName, fop.Name,
-							)
-
-							ch <- prometheus.MustNewConstMetric(
-								brickFopLatencyMin, prometheus.CounterValue, float64(fop.MinLatency), volume.Name, brick.BrickName, fop.Name,
-							)
-
-							ch <- prometheus.MustNewConstMetric(
-								brickFopLatencyMax, prometheus.CounterValue, float64(fop.MaxLatency), volume.Name, brick.BrickName, fop.Name,
-							)
-						}
+						ch <- prometheus.MustNewConstMetric(
+							brickFopLatencyMax, prometheus.CounterValue, float64(fop.MaxLatency), volume.Name, brick.BrickName, fop.Name,
+						)
 					}
+					//}
 
 				}
 			}
@@ -267,6 +285,8 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	volumeStatusAll, err := ExecVolumeStatusAllDetail()
 	if err != nil {
 		log.Errorf("couldn't parse xml of peer status: %v", err)
+		//close(ch)
+		return
 	}
 	for _, vol := range volumeStatusAll.VolStatus.Volumes {
 		for _, node := range vol.Volume.Node {
@@ -293,11 +313,33 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
 	for _, vol := range vols {
 		filesCount, volumeHealErr := ExecVolumeHealInfo(vol)
-		if volumeHealErr == nil {
-			ch <- prometheus.MustNewConstMetric(
-				healInfoFilesCount, prometheus.CounterValue, float64(filesCount), vol,
-			)
+
+		if volumeHealErr != nil {
+			log.Error(volumeHealErr)
+			return
 		}
+
+		ch <- prometheus.MustNewConstMetric(
+			healInfoFilesCount, prometheus.CounterValue, float64(filesCount), vol,
+		)
+
+		geoRepLastSync, geoRepErr := ExecVolumeGeoReplicationStatus(vol)
+
+		if geoRepErr != nil {
+			log.Error(geoRepErr)
+			return
+		}
+
+		geoRepLastSyncTime, timeErr := time.ParseInLocation("2006-01-02 15:04:05", geoRepLastSync, time.UTC)
+
+		if timeErr != nil {
+			log.Error(timeErr)
+			return
+		}
+
+		ch <- prometheus.MustNewConstMetric(
+			lastGeoReplicationSyncTime, prometheus.CounterValue, float64(geoRepLastSyncTime.Unix()), vol,
+		)
 	}
 
 	mountBuffer, execMountCheckErr := execMountCheck()
@@ -398,12 +440,13 @@ func main() {
 
 	// commandline arguments
 	var (
-		glusterPath    = flag.String("gluster_executable_path", GlusterCmd, "Path to gluster executable.")
-		metricPath     = flag.String("metrics-path", "/metrics", "URL Endpoint for metrics")
-		listenAddress  = flag.String("listen-address", ":9189", "The address to listen on for HTTP requests.")
-		showVersion    = flag.Bool("version", false, "Prints version information")
-		glusterVolumes = flag.String("volumes", allVolumes, fmt.Sprintf("Comma separated volume names: vol1,vol2,vol3. Default is '%v' to scrape all metrics", allVolumes))
-		profile        = flag.Bool("profile", false, "When profiling reports in gluster are enabled, set ' -profile true' to get more metrics")
+		glusterPath     = flag.String("gluster_executable_path", GlusterCmd, "Path to gluster executable.")
+		glusterHostname = flag.String("gluster-hostname", "", "Gluster hostname, default to OS hostname")
+		metricPath      = flag.String("metrics-path", "/metrics", "URL Endpoint for metrics")
+		listenAddress   = flag.String("listen-address", ":9189", "The address to listen on for HTTP requests.")
+		showVersion     = flag.Bool("version", false, "Prints version information")
+		glusterVolumes  = flag.String("volumes", allVolumes, fmt.Sprintf("Comma separated volume names: vol1,vol2,vol3. Default is '%v' to scrape all metrics", allVolumes))
+		profile         = flag.Bool("profile", false, "When profiling reports in gluster are enabled, set ' -profile true' to get more metrics")
 	)
 	flag.Parse()
 
@@ -411,13 +454,30 @@ func main() {
 		versionInfo()
 	}
 
-	hostname, err := os.Hostname()
-	if err != nil {
-		log.Fatalf("While trying to get Hostname error happened: %v", err)
+	var hostname string
+
+	fmt.Printf("glusterHostname %s\n", *glusterHostname)
+
+	if *glusterHostname != "" {
+		hostname = *glusterHostname
+	} else {
+		autoHostname, err := os.Hostname()
+
+		if err != nil {
+			log.Fatalf("While trying to get Hostname error happened: %v", err)
+		}
+
+		hostname = autoHostname
 	}
+
+	fmt.Printf("Using gluster hostname %s\n", hostname)
+
 	exporter, err := NewExporter(hostname, *glusterPath, *glusterVolumes, *profile)
+
 	if err != nil {
 		log.Errorf("Creating new Exporter went wrong, ... \n%v", err)
+		return
+
 	}
 	prometheus.MustRegister(exporter)
 

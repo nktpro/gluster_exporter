@@ -54,11 +54,11 @@ func execTouchOnVolumes(mountpoint string) (bool, error) {
 
 // ExecVolumeInfo executes "gluster volume info" at the local machine and
 // returns VolumeInfoXML struct and error
-func ExecVolumeInfo() (structs.VolumeInfoXML, error) {
+func ExecVolumeInfo() (*structs.VolumeInfoXML, error) {
 	args := []string{"volume", "info"}
 	bytesBuffer, cmdErr := execGlusterCommand(args...)
 	if cmdErr != nil {
-		return structs.VolumeInfoXML{}, cmdErr
+		return nil, cmdErr
 	}
 	volumeInfo, err := structs.VolumeInfoXMLUnmarshall(bytesBuffer)
 	if err != nil {
@@ -158,4 +158,30 @@ func ExecVolumeHealInfo(volumeName string) (int, error) {
 		entriesOutOfSync += count
 	}
 	return entriesOutOfSync, nil
+}
+
+func ExecVolumeGeoReplicationStatus(volumeName string) (string, error) {
+	args := []string{"volume", "geo-replication", volumeName, "status"}
+	bytesBuffer, cmdErr := execGlusterCommand(args...)
+	if cmdErr != nil {
+		return "", cmdErr
+	}
+	geoRep, err := structs.GeoReplicationStatusXMLUnmarshall(bytesBuffer)
+	if err != nil {
+		log.Error(err)
+		return "", err
+	}
+
+	for _, volume := range geoRep.GeoRep.GeoRepVolumes {
+		if volume.VolumeName == volumeName {
+			for _, session := range volume.GeoRepSessions.GeoRepSessions {
+				for _, pair := range session.SessionPairs {
+					if pair.LastSynced != "N/A" {
+						return pair.LastSynced, nil
+					}
+				}
+			}
+		}
+	}
+	return "", nil
 }
